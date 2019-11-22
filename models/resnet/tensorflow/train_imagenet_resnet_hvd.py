@@ -25,6 +25,44 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+'''
+To run with synthetic data
+
+docker run -it --gpus 8 --net=host -v /home/ubuntu/resnet:/resnet \
+-v /home/ubuntu/data:/data \
+horovod/horovod:0.18.2-tf2.0.0-torch1.3.0-mxnet1.5.0-py3.6-gpu \
+/bin/bash -c "pip install tensorflow_addons && \
+mpirun --allow-run-as-root -np 8 --H localhost:8 \
+-mca plm_rsh_no_tree_spawn 1 \
+-bind-to socket -map-by slot \
+-x HOROVOD_HIERARCHICAL_ALLREDUCE=1 -x HOROVOD_FUSION_THRESHOLD=16777216 \
+-x NCCL_MIN_NRINGS=4 -x LD_LIBRARY_PATH -x PATH -mca pml ob1 -mca btl ^openib \
+-x NCCL_SOCKET_IFNAME=$INTERFACE -mca btl_tcp_if_exclude lo,docker0 \
+-x TF_CPP_MIN_LOG_LEVEL=0 \
+python -W ignore /resnet/tf_train_imagenet_resnet_hvd_v3.py \
+--synthetic --batch_size 64 --num_batches 8000"
+
+To run on imagenet data
+
+mkdir data
+aws s3 cp --recursive s3://aws-tensorflow-benchmarking/imagenet-armand/train-480px .
+
+docker run -it --gpus 8 --net=host -v /home/ubuntu/resnet:/resnet \
+-v /home/ubuntu/data:/data \
+horovod/horovod:0.18.2-tf2.0.0-torch1.3.0-mxnet1.5.0-py3.6-gpu \
+/bin/bash -c "pip install tensorflow_addons && \
+mpirun --allow-run-as-root -np 8 --H localhost:8 \
+-mca plm_rsh_no_tree_spawn 1 \
+-bind-to socket -map-by slot \
+-x HOROVOD_HIERARCHICAL_ALLREDUCE=1 -x HOROVOD_FUSION_THRESHOLD=16777216 \
+-x NCCL_MIN_NRINGS=4 -x LD_LIBRARY_PATH -x PATH -mca pml ob1 -mca btl ^openib \
+-x NCCL_SOCKET_IFNAME=$INTERFACE -mca btl_tcp_if_exclude lo,docker0 \
+-x TF_CPP_MIN_LOG_LEVEL=0 \
+python -W ignore /resnet/tf_train_imagenet_resnet_hvd_v3.py \
+--data_dir /data --batch_size 64 --num_batches 8000"
+'''
+
+
 from __future__ import print_function
 
 try:
@@ -33,10 +71,11 @@ except ImportError:
     pass
 import tensorflow as tf
 import numpy as np
-from tensorflow.contrib.image.python.ops import distort_image_ops
+#from tensorflow.contrib.image.python.ops import distort_image_ops
+from tensorflow_addons.image import distort_image_ops
 from tensorflow.python.ops import data_flow_ops
-from tensorflow.contrib.data.python.ops import interleave_ops
-from tensorflow.contrib.data.python.ops import batching
+#from tensorflow.contrib.data.python.ops import interleave_ops
+#from tensorflow.contrib.data.python.ops import batching
 import horovod.tensorflow as hvd
 import os
 import sys
@@ -72,40 +111,39 @@ class LayerBuilder(object):
         self.adv_bn_init = adv_bn_init
         if self.batch_norm_config is None:
             self.batch_norm_config = {
-                'decay': 0.9,
+                'momentum': 0.9,
                 'epsilon': 1e-4,
                 'scale': True,
-                'zero_debias_moving_mean': False,
             }
 
     def _conv2d(self, inputs, activation, *args, **kwargs):
-        x = tf.layers.conv2d(
-            inputs, data_format=self.data_format,
+        x = tf.keras.layers.Conv2D(
+            data_format=self.data_format,
             use_bias=not self.use_batch_norm,
             kernel_initializer=self.conv_initializer,
             activation=None if self.use_batch_norm else activation,
-            *args, **kwargs)
+            *args, **kwargs)(inputs)
         if self.use_batch_norm:
             x = self.batch_norm(x)
             x = activation(x) if activation is not None else x
         return x
 
     def conv2d_linear_last_bn(self, inputs, *args, **kwargs):
-        x = tf.layers.conv2d(
-            inputs, data_format=self.data_format,
+        x = tf.keras.layers.Conv2D(
+            data_format=self.data_format,
             use_bias=False,
             kernel_initializer=self.conv_initializer,
-            activation=None, *args, **kwargs)
+            activation=None, *args, **kwargs)(inputs)
         param_initializers = {
-            'moving_mean': tf.zeros_initializer(),
-            'moving_variance': tf.ones_initializer(),
-            'beta': tf.zeros_initializer(),
+            'moving_mean_initializer': tf.zeros_initializer(),
+            'moving_variance_initializer': tf.ones_initializer(),
+            'beta_initializer': tf.zeros_initializer(),
         }
         if self.adv_bn_init:
-            param_initializers['gamma'] = tf.zeros_initializer()
+            param_initializers['gamma_initializer'] = tf.zeros_initializer()
         else:
-            param_initializers['gamma'] = tf.ones_initializer()
-        x = self.batch_norm(x, param_initializers=param_initializers)
+            param_initializers['gamma_initializer'] = tf.ones_initializer()
+        x = self.batch_norm(x, **param_initializers)
         return x
 
     def conv2d_linear(self, inputs, *args, **kwargs):
@@ -132,8 +170,8 @@ class LayerBuilder(object):
         return tf.pad(inputs, padding)
 
     def max_pooling2d(self, inputs, *args, **kwargs):
-        return tf.layers.max_pooling2d(
-            inputs, data_format=self.data_format, *args, **kwargs)
+        return tf.keras.layers.MaxPool2D(
+            data_format=self.data_format, *args, **kwargs)(inputs)
 
     def average_pooling2d(self, inputs, *args, **kwargs):
         return tf.layers.average_pooling2d(
@@ -153,9 +191,9 @@ class LayerBuilder(object):
         all_kwargs = dict(self.batch_norm_config)
         all_kwargs.update(kwargs)
         data_format = 'NHWC' if self.data_format == 'channels_last' else 'NCHW'
-        return tf.contrib.layers.batch_norm(
-            inputs, is_training=self.training, data_format=data_format,
-            fused=True, **all_kwargs)
+        axis = -1 if self.data_format == 'channels_last' else 1
+        return tf.keras.layers.BatchNormalization(
+            axis = axis, fused=True, **all_kwargs)(inputs, self.training)
 
     def spatial_average2d(self, inputs):
         shape = inputs.get_shape().as_list()
@@ -164,8 +202,8 @@ class LayerBuilder(object):
         else:
             n, c, h, w = shape
         n = -1 if n is None else n
-        x = tf.layers.average_pooling2d(inputs, (h, w), (1, 1),
-                                        data_format=self.data_format)
+        x = tf.keras.layers.AveragePooling2D((h, w), (1, 1),
+                                        data_format=self.data_format)(inputs)
         return tf.reshape(x, [n, c])
 
     def flatten2d(self, inputs):
@@ -271,16 +309,16 @@ def get_model_func(model_name):
 
 def deserialize_image_record(record):
     feature_map = {
-        'image/encoded': tf.FixedLenFeature([], tf.string, ''),
-        'image/class/label': tf.FixedLenFeature([1], tf.int64, -1),
-        'image/class/text': tf.FixedLenFeature([], tf.string, ''),
-        'image/object/bbox/xmin': tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/ymin': tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/xmax': tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/ymax': tf.VarLenFeature(dtype=tf.float32)
+        'image/encoded': tf.compat.v1.FixedLenFeature([], tf.string, ''),
+        'image/class/label': tf.compat.v1.FixedLenFeature([1], tf.int64, -1),
+        'image/class/text': tf.compat.v1.FixedLenFeature([], tf.string, ''),
+        'image/object/bbox/xmin': tf.compat.v1.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymin': tf.compat.v1.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/xmax': tf.compat.v1.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymax': tf.compat.v1.VarLenFeature(dtype=tf.float32)
     }
     with tf.name_scope('deserialize_image_record'):
-        obj = tf.parse_single_example(record, feature_map)
+        obj = tf.compat.v1.parse_single_example(record, feature_map)
         imgdata = obj['image/encoded']
         label = tf.cast(obj['image/class/label'], tf.int32)
         bbox = tf.stack([obj['image/object/bbox/%s' % x].values
@@ -402,18 +440,20 @@ def stage(tensors):
         shapes=[tensor.get_shape() for tensor in tensors])
     put_op = stage_area.put(tensors)
     get_tensors = stage_area.get()
-    tf.add_to_collection('STAGING_AREA_PUTS', put_op)
+    tf.compat.v1.add_to_collection('STAGING_AREA_PUTS', put_op)
     return put_op, get_tensors
 
 
-class PrefillStagingAreasHook(tf.train.SessionRunHook):
+#class PrefillStagingAreasHook(tf.train.SessionRunHook):
+class PrefillStagingAreasHook(tf.estimator.SessionRunHook):
     def after_create_session(self, session, coord):
-        enqueue_ops = tf.get_collection('STAGING_AREA_PUTS')
+        enqueue_ops = tf.compat.v1.get_collection('STAGING_AREA_PUTS')
         for i in range(len(enqueue_ops)):
             session.run(enqueue_ops[:i + 1])
 
 
-class LogSessionRunHook(tf.train.SessionRunHook):
+#class LogSessionRunHook(tf.train.SessionRunHook):
+class LogSessionRunHook(tf.estimator.SessionRunHook):
     def __init__(self, global_batch_size, num_records, display_every=10, logger=None):
         self.global_batch_size = global_batch_size
         self.num_records = num_records
@@ -427,8 +467,8 @@ class LogSessionRunHook(tf.train.SessionRunHook):
 
     def before_run(self, run_context):
         self.t0 = time.time()
-        return tf.train.SessionRunArgs(
-            fetches=[tf.train.get_global_step(),
+        return tf.compat.v1.train.SessionRunArgs(
+            fetches=[tf.compat.v1.train.get_global_step(),
                      'loss:0', 'total_loss:0', 'learning_rate:0'])
 
     def after_run(self, run_context, run_values):
@@ -469,11 +509,12 @@ def fp32_trainable_vars(name='fp32_vars', *args, **kwargs):
     """A varible scope with custom variable getter to convert fp16 trainable
     variables with fp32 storage followed by fp16 cast.
     """
-    return tf.variable_scope(
+    return tf.compat.v1.variable_scope(
         name, custom_getter=_fp32_trainvar_getter, *args, **kwargs)
 
 
-class MixedPrecisionOptimizer(tf.train.Optimizer):
+#class MixedPrecisionOptimizer(tf.train.Optimizer):
+class MixedPrecisionOptimizer(tf.compat.v1.train.Optimizer):
     """An optimizer that updates trainable variables in fp32."""
 
     def __init__(self, optimizer,
@@ -488,8 +529,8 @@ class MixedPrecisionOptimizer(tf.train.Optimizer):
     def compute_gradients(self, loss, var_list=None, *args, **kwargs):
         if var_list is None:
             var_list = (
-                    tf.trainable_variables() +
-                    tf.get_collection(tf.GraphKeys.TRAINABLE_RESOURCE_VARIABLES))
+                    tf.compat.v1.trainable_variables() +
+                    tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_RESOURCE_VARIABLES))
 
         replaced_list = var_list
 
@@ -511,7 +552,8 @@ class MixedPrecisionOptimizer(tf.train.Optimizer):
     def apply_gradients(self, *args, **kwargs):
         return self._optimizer.apply_gradients(*args, **kwargs)
 
-class LarcOptimizer(tf.train.Optimizer):
+#class LarcOptimizer(tf.train.Optimizer):
+class LarcOptimizer(tf.compat.v1.train.Optimizer):
     """ LARC implementation
         -------------------
         Parameters:
@@ -578,7 +620,7 @@ def get_lr(lr, steps, lr_steps, warmup_it, decay_steps, global_step, lr_decay_mo
                                                     steps, lr_steps)
     elif lr_decay_mode == 'poly' or lr_decay_mode == 'poly_cycle':
         cycle = lr_decay_mode == 'poly_cycle'
-        learning_rate = tf.train.polynomial_decay(lr,
+        learning_rate = tf.compat.v1.train.polynomial_decay(lr,
                                                   global_step - warmup_it,
                                                   decay_steps=decay_steps - warmup_it,
                                                   end_learning_rate=0.00001,
@@ -665,12 +707,12 @@ def cnn_model_function(features, labels, mode, params):
         if model_format == 'channels_first':
             inputs = tf.transpose(inputs, [0, 3, 1, 2])
         with fp32_trainable_vars(
-                regularizer=tf.contrib.layers.l2_regularizer(weight_decay)):
+                regularizer=tf.keras.regularizers.l2(weight_decay)): #tf.contrib.layers.l2_regularizer(weight_decay)):
             top_layer = model_func(
                 inputs, data_format=model_format, training=is_training,
                 conv_initializer=conv_init, adv_bn_init=adv_bn_init)
-            logits = tf.layers.dense(top_layer, num_classes,
-                                     kernel_initializer=tf.random_normal_initializer(stddev=0.01))
+            logits = tf.keras.layers.Dense(num_classes,
+                                     kernel_initializer=tf.random_normal_initializer(stddev=0.01))(top_layer)
         predicted_classes = tf.argmax(logits, axis=1, output_type=tf.int32)
         logits = tf.cast(logits, tf.float32)
         if mode == tf.estimator.ModeKeys.PREDICT:
@@ -681,7 +723,9 @@ def cnn_model_function(features, labels, mode, params):
                 'logits': logits
             }
             return tf.estimator.EstimatorSpec(mode, predictions=predictions)
-        loss = tf.losses.sparse_softmax_cross_entropy(
+        '''loss = tf.keras.losses.sparse_categorical_crossentropy(
+            y_pred=logits, y_true=labels, from_logits=True)'''
+        loss = tf.compat.v1.losses.sparse_softmax_cross_entropy(
             logits=logits, labels=labels)
         loss = tf.identity(loss, name='loss')  # For access by logger (TODO: Better way to access it?)
 
@@ -698,35 +742,34 @@ def cnn_model_function(features, labels, mode, params):
                 mode, loss=loss, eval_metric_ops=metrics)
 
         assert (mode == tf.estimator.ModeKeys.TRAIN)
-        reg_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+        reg_losses = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.REGULARIZATION_LOSSES)
         total_loss = tf.add_n([loss] + reg_losses, name='total_loss')
 
         batch_size = tf.shape(inputs)[0]
 
-        global_step = tf.train.get_global_step()
+        global_step = tf.compat.v1.train.get_global_step()
 
         with tf.device('/cpu:0'):  # Allow fallback to CPU if no GPU support for these ops
             learning_rate = tf.cond(global_step < warmup_it,
-                                    lambda: warmup_decay(warmup_lr, global_step, warmup_it,
-                                                         lr),
-                                    lambda: get_lr(lr, steps, lr_steps, warmup_it, decay_steps, global_step,
-                                                   lr_decay_mode, 
-                                                   cdr_first_decay_ratio, cdr_t_mul, cdr_m_mul, cdr_alpha, 
-                                                   lc_periods, lc_alpha, lc_beta))
+                                        lambda: warmup_decay(warmup_lr, global_step, warmup_it,
+                                                             lr),
+                                        lambda: get_lr(lr, steps, lr_steps, warmup_it, decay_steps, global_step,
+                                                       lr_decay_mode, 
+                                                       cdr_first_decay_ratio, cdr_t_mul, cdr_m_mul, cdr_alpha, 
+                                                       lc_periods, lc_alpha, lc_beta))
             learning_rate = tf.identity(learning_rate, 'learning_rate')
             tf.summary.scalar('learning_rate', learning_rate)
-
-        opt = tf.train.MomentumOptimizer(
+        opt = tf.compat.v1.train.MomentumOptimizer(
             learning_rate, momentum, use_nesterov=True)
         opt = hvd.DistributedOptimizer(opt)
         if use_larc:
             opt = LarcOptimizer(opt, learning_rate, leta, clip=True)
         opt = MixedPrecisionOptimizer(opt, scale=loss_scale)
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS) or []
+        update_ops = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS) or []
         with tf.control_dependencies(update_ops):
-            gate_gradients = (tf.train.Optimizer.GATE_NONE)
+            gate_gradients = (tf.compat.v1.train.Optimizer.GATE_NONE)
             train_op = opt.minimize(
-                total_loss, global_step=tf.train.get_global_step(),
+                total_loss, global_step=tf.compat.v1.train.get_global_step(),
                 gate_gradients=gate_gradients)
         train_op = tf.group(preload_op, gpucopy_op, train_op)  # , update_ops)
 
@@ -736,7 +779,7 @@ def cnn_model_function(features, labels, mode, params):
 def get_num_records(filenames):
     def count_records(tf_record_filename):
         count = 0
-        for _ in tf.python_io.tf_record_iterator(tf_record_filename):
+        for _ in tf.compat.v1.python_io.tf_record_iterator(tf_record_filename):
             count += 1
         return count
 
@@ -812,7 +855,7 @@ def add_cli_args():
     cmdline.add_argument('--save_summary_steps', type=int, default=0)
     add_bool_argument(cmdline, '--adv_bn_init', default=True,
                       help="""init gamme of the last BN of each ResMod at 0.""")
-    add_bool_argument(cmdline, '--adv_conv_init', default=True,
+    add_bool_argument(cmdline, '--adv_conv_init', default=False,
                       help="""init conv with MSRA initializer""")
 
     cmdline.add_argument('--lr', type=float,
@@ -893,7 +936,8 @@ def main():
     hvd.init()
 
 
-    config = tf.ConfigProto()
+    #config = tf.ConfigProto()
+    config = tf.compat.v1.ConfigProto()
     config.gpu_options.visible_device_list = str(hvd.local_rank())
     config.gpu_options.force_gpu_compatible = True  # Force pinned memory
     config.intra_op_parallelism_threads = 1  # Avoid pool of Eigen threads
@@ -921,13 +965,13 @@ def main():
         do_checkpoint = hvd.rank() == 0
     if hvd.local_rank() == 0 and FLAGS.clear_log and os.path.isdir(FLAGS.log_dir):
         shutil.rmtree(FLAGS.log_dir)
-    barrier = hvd.allreduce(tf.constant(0, dtype=tf.float32))
-    tf.Session(config=config).run(barrier)
+    #barrier = hvd.allreduce(tf.constant(0, dtype=tf.float32))
+    #tf.compat.v1.Session(config=config).run(barrier)
 
     if hvd.local_rank() == 0 and not os.path.isdir(FLAGS.log_dir):
         os.makedirs(FLAGS.log_dir)
-    barrier = hvd.allreduce(tf.constant(0, dtype=tf.float32))
-    tf.Session(config=config).run(barrier)
+    #barrier = hvd.allreduce(tf.constant(0, dtype=tf.float32))
+    #tf.compat.v1.Session(config=config).run(barrier)
     
     logger = logging.getLogger(FLAGS.log_name)
     logger.setLevel(logging.INFO)  # INFO, ERROR
@@ -954,8 +998,8 @@ def main():
 
     if FLAGS.data_dir:
         filename_pattern = os.path.join(FLAGS.data_dir, '%s-*')
-        train_filenames = sorted(tf.gfile.Glob(filename_pattern % 'train'))
-        eval_filenames = sorted(tf.gfile.Glob(filename_pattern % 'validation'))
+        train_filenames = sorted(tf.compat.v1.gfile.Glob(filename_pattern % 'train'))
+        eval_filenames = sorted(tf.compat.v1.gfile.Glob(filename_pattern % 'validation'))
         num_training_samples = get_num_records(train_filenames)
         rank0log(logger, "Using data from: ", FLAGS.data_dir)
         if not FLAGS.eval:
@@ -1115,3 +1159,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
