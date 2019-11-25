@@ -814,7 +814,7 @@ def add_cli_args():
                          (aka Example protobufs). Files should be
                          named 'train-*' and 'validation-*'.""")
     add_bool_argument(cmdline, '--synthetic', help="""Whether to use synthetic data for training""")
-    cmdline.add_argument('-b', '--batch_size', default=256, type=int,
+    cmdline.add_argument('-b', '--batch_size', default=128, type=int,
                          help="""Size of each minibatch per GPU""")
     cmdline.add_argument('--num_batches', type=int,
                          help="""Number of batches to run.
